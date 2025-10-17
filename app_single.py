@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MyAddon FastAPI license server (single-file, fixed)
-- تخزين JSON في DB_PATH أو db.json
-- ADMIN_TOKEN من متغير بيئة
-- لوحة إدارة داكنة + عدّاد أونلاين
-تشغيل محلي:
+MyAddon — FastAPI single-file server (modern admin UI)
+- JSON DB (DB_PATH or ./db.json)
+- ADMIN_TOKEN from env or default
+- Hidden token (password field), no token in URL
+- Accurate online counter (last_seen window)
+- Keys: multiline input (one per line) or auto-generate if empty
+- Edit user ID + migrate keys.used_by
+- Bulk zero with confirmation + backup/undo
+Run local:
     uvicorn app_single:app --host 0.0.0.0 --port 8000 --reload
 """
 
@@ -14,11 +18,14 @@ from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from pydantic import BaseModel
 from datetime import datetime, timezone
-import os, json, re, secrets
+import os, json, re, secrets, shutil
 
-APP_TITLE = "MyAddon Server (Single)"
+APP_TITLE = "MyAddon Server"
 DB_FILE   = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "db.json"))
-ADMIN_TOKEN_ENV = os.getenv("ADMIN_TOKEN")  # يغلب القيمة الافتراضية عند الإنشاء
+ADMIN_TOKEN_ENV = os.getenv("ADMIN_TOKEN")  # يغلب الافتراضي إن وُجد
+
+# نافذة حساب "أونلاين" بالثواني (5 دقائق)
+ONLINE_WINDOW_SEC = 300
 
 app = FastAPI(title=APP_TITLE)
 
@@ -28,7 +35,8 @@ DEFAULT_DB = {
         "free_mode": False,
         "lockdown": False,
         "online": 0,
-        "admin_token": "admin",
+        # التوكن الافتراضي — يفضّل ضبط ADMIN_TOKEN في Render
+        "admin_token": "202426933Ibrahim",
     },
     "users": {},
     "keys": {},
@@ -38,9 +46,12 @@ DEFAULT_DB = {
 def now_ts() -> int:
     return int(datetime.now(tz=timezone.utc).timestamp())
 
+def db_dir() -> str:
+    return os.path.dirname(DB_FILE) or "."
+
 def save_db(db: dict) -> None:
+    os.makedirs(db_dir(), exist_ok=True)
     tmp = DB_FILE + ".tmp"
-    os.makedirs(os.path.dirname(DB_FILE) or ".", exist_ok=True)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
     os.replace(tmp, DB_FILE)
@@ -53,6 +64,20 @@ def load_db() -> dict:
         save_db(initial)
     with open(DB_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
+
+def backup_db() -> str:
+    """يعمل نسخة احتياطية قبل عمليات جذرية (تُستخدم للـUndo)."""
+    os.makedirs(db_dir(), exist_ok=True)
+    bak = DB_FILE + ".bak"
+    shutil.copy2(DB_FILE, bak) if os.path.exists(DB_FILE) else save_db(DEFAULT_DB)
+    return bak
+
+def restore_backup() -> bool:
+    bak = DB_FILE + ".bak"
+    if os.path.exists(bak):
+        shutil.copy2(bak, DB_FILE)
+        return True
+    return False
 
 def ensure_user(db: dict, uid: str) -> dict:
     u = db["users"].get(uid)
@@ -90,15 +115,17 @@ def minutes_from_unit(amount: int, unit: str) -> int:
 
 KEY_RE = re.compile(r"^[A-Z0-9]{4,6}(?:-[A-Z0-9]{4,6}){0,3}$", re.I)
 
-def _compute_online(db: dict, window_seconds: int = 300) -> int:
+def _compute_online(db: dict, window_seconds: int = ONLINE_WINDOW_SEC) -> int:
     now = now_ts()
-    cnt = 0
-    for u in db.get("users", {}).values():
-        if now - int(u.get("last_seen", 0)) <= window_seconds:
-            cnt += 1
-    return cnt
+    return sum(1 for u in db.get("users", {}).values()
+               if now - int(u.get("last_seen", 0)) <= window_seconds)
 
-# ------------------------------ API used by AHK ------------------------------
+# ------------------------------ API (used by client) ------------------------------
+class KeyActivateReq(BaseModel):
+    id: str
+    hwid: str | None = ""
+    key: str
+
 @app.get("/api/check")
 def api_check(id: str = "", hwid: str = ""):
     db = load_db()
@@ -114,14 +141,13 @@ def api_check(id: str = "", hwid: str = ""):
         "online": 0
     }
 
-    # lockdown: منع فوري مع تحديث الأونلاين
+    # إقفال مؤقت
     if g.get("lockdown", False):
         g["online"] = _compute_online(db)
         save_db(db)
         resp["online"] = g["online"]
         return JSONResponse(resp)
 
-    # إن كان معرفًا
     u = db["users"].get(id) if id else None
 
     # محظور؟
@@ -132,11 +158,12 @@ def api_check(id: str = "", hwid: str = ""):
         resp["online"] = g["online"]
         return JSONResponse(resp)
 
-    # free_mode يسمح للجميع (غير المحظورين)
+    # وضع مجاني للجميع
     if g.get("free_mode", False):
         resp["ok"] = True
         if id:
             u = ensure_user(db, id)
+            # ربط HWID إن وُجد وتحت حد الأجهزة
             if hwid:
                 hwids = list(u.get("hwids", []))
                 if hwid not in hwids and len(hwids) < int(u.get("devices",1)):
@@ -149,7 +176,7 @@ def api_check(id: str = "", hwid: str = ""):
         resp["online"] = g["online"]
         return JSONResponse(resp)
 
-    # ليس لديه اشتراك
+    # لا يملك اشتراك
     if not u:
         g["online"] = _compute_online(db)
         save_db(db)
@@ -162,7 +189,6 @@ def api_check(id: str = "", hwid: str = ""):
     if hwid and hwid not in hwids and len(hwids) < dev_limit:
         hwids.append(hwid)
         u["hwids"] = hwids
-        db["users"][id] = u
 
     # تجاوز الحد
     if len(u.get("hwids", [])) > dev_limit:
@@ -171,35 +197,24 @@ def api_check(id: str = "", hwid: str = ""):
         resp["online"] = g["online"]
         return JSONResponse(resp)
 
-    # آخر ظهور
+    # تحديث آخر ظهور
     u["last_seen"] = now_ts()
-    db["users"][id] = u
 
-    # غير محدود
+    # غير محدود؟
     if u.get("unlimited", False):
         resp["ok"] = True
         resp["unlimited"] = True
-        g["online"] = _compute_online(db)
-        save_db(db)
-        resp["online"] = g["online"]
-        return JSONResponse(resp)
+    else:
+        remain = int(u.get("expires_at", 0)) - now_ts()
+        if remain > 0:
+            resp["ok"] = True
+            resp["remain"] = remain
 
-    # وقت متبقّي
-    remain = int(u.get("expires_at", 0)) - now_ts()
-    if remain > 0:
-        resp["ok"] = True
-        resp["remain"] = remain
-
+    db["users"][u["id"]] = u
     g["online"] = _compute_online(db)
-    db["globals"]["online"] = g["online"]
     save_db(db)
     resp["online"] = g["online"]
     return JSONResponse(resp)
-
-class KeyActivateReq(BaseModel):
-    id: str
-    hwid: str | None = ""
-    key: str
 
 @app.post("/api/activate/key")
 def api_activate_by_key(req: KeyActivateReq):
@@ -224,12 +239,12 @@ def api_activate_by_key(req: KeyActivateReq):
         return JSONResponse({"ok": False, "msg": "banned"})
 
     # حد الأجهزة
-    devices = int(key.get("devices", 1))
-    u["devices"] = max(1, devices)
+    u["devices"] = max(1, int(key.get("devices", 1)))
 
     # ربط HWID
     if req.hwid and req.hwid not in u["hwids"]:
-        u["hwids"].append(req.hwid)
+        if len(u["hwids"]) < u["devices"]:
+            u["hwids"].append(req.hwid)
 
     if key.get("unlimited", False):
         u["unlimited"] = True
@@ -248,7 +263,7 @@ def api_activate_by_key(req: KeyActivateReq):
     save_db(db)
     return JSONResponse({"ok": True, "msg": "activated"})
 
-# ------------------------------ Admin helpers ------------------------------
+# ------------------------------ Admin helpers + UI ------------------------------
 def require_admin(db: dict, token: str | None, level: str = "viewer"):
     need = db["globals"].get("admin_token", "admin")
     if need and token != need:
@@ -260,47 +275,84 @@ def html_shell(title: str, body: str) -> HTMLResponse:
 <html dir="rtl" lang="ar"><head>
 <meta charset="utf-8"/>
 <title>{title}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
 <style>
-:root {{ --bg:#0b0b0b; --panel:#101010; --border:#2a2a2a; --text:#eaeaea; --accent:#ffd28a; --link:#7cc8ff; }}
-body{{background:var(--bg);color:var(--text);font-family:Segoe UI,Arial;margin:20px}}
-h1,h2{{color:var(--accent)}}
-input,select,button,textarea{{background:#111;color:#fff;border:1px solid var(--border);border-radius:8px;padding:6px}}
+:root {{
+  --bg:#0b0d10; --panel:#0f141a; --panel2:#0b1015; --border:#1f2a36;
+  --text:#e6edf3; --muted:#9fb3c8; --accent:#ffd28a; --link:#7cc8ff;
+  --ok:#3ddc97; --bad:#ff8a8a; --btn:#161b22; --btnb:#2d3947;
+}}
+*{{box-sizing:border-box}}
+body{{background:var(--bg);color:var(--text);font-family:Segoe UI,Arial;margin:16px}}
 a{{color:var(--link)}}
-hr{{border:0;border-top:1px solid var(--border);margin:18px 0}}
-.box{{border:1px solid var(--border);border-radius:12px;padding:12px;margin:10px 0;background:var(--panel)}}
-.small{{font-size:12px;opacity:.8}}
-table{{border-collapse:collapse;width:100%}}
-td,th{{border:1px solid var(--border);padding:6px;text-align:center}}
-.ok{{color:#51e351}} .bad{{color:#ff8a8a}}
-.topbar{{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-bottom:10px}}
-.badge{{background:#1a1a1a;border:1px solid var(--border);border-radius:999px;padding:6px 10px}}
-</style></head><body>
+h1,h2{{color:var(--accent);margin:8px 0 10px}}
+.card{{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:14px;padding:14px;margin:10px 0}}
+.topbar{{position:sticky;top:0;z-index:10;background:var(--bg);padding-bottom:8px;margin-bottom:10px;border-bottom:1px solid var(--border)}}
+.badge{{background:#0d1b26;border:1px solid var(--border);border-radius:999px;padding:6px 10px;color:var(--text);display:inline-flex;gap:6px;align-items:center}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}}
+label{{display:inline-block;margin:4px 0}}
+input,select,button,textarea{{background:var(--btn);color:var(--text);border:1px solid var(--btnb);border-radius:10px;padding:8px}}
+button{{cursor:pointer}}
+button.primary{{background:#1f2a36;border-color:#3b4c61}}
+button.danger{{background:#2a1515;border-color:#703939;color:#ffbdbd}}
+table{{border-collapse:collapse;width:100%;font-size:14px}}
+th,td{{border:1px solid var(--border);padding:6px;text-align:center}}
+.small{{font-size:12px;color:var(--muted)}}
+.ok{{color:var(--ok)}} .bad{{color:var(--bad)}}
+.pwwrap{{display:flex;align-items:center;gap:8px}}
+hr{{border:0;border-top:1px solid var(--border);margin:16px 0}}
+.codebox{{font-family:Consolas,monospace;font-size:12px;background:#0b1218;padding:10px;border-radius:10px;border:1px dashed var(--border)}}
+</style>
+<script>
+function wireToken(){{
+  const pw = document.getElementById('admintoken');
+  function inject(form){{
+    if(!pw) return true;
+    const h = form.querySelector('input[name=token]');
+    if(h) h.value = pw.value;
+    return true;
+  }}
+  document.querySelectorAll('form').forEach(f=>{{
+    f.addEventListener('submit', ()=>inject(f));
+  }});
+  const tgl=document.getElementById('togglepw');
+  if(tgl && pw){{
+    tgl.addEventListener('click', ()=>{
+      pw.type = (pw.type==='password'?'text':'password');
+      tgl.textContent = (pw.type==='password'?'إظهار':'إخفاء');
+    });
+  }}
+}}
+window.addEventListener('DOMContentLoaded', wireToken);
+</script>
+</head><body>
 {body}
 </body></html>"""
     return HTMLResponse(page)
 
 def render_users_table(db: dict, only_active=False, only_banned=False) -> str:
     rows = []
+    now = now_ts()
     for u in db["users"].values():
-        if only_active:
-            active = u.get("unlimited") or (u.get("expires_at",0) > now_ts())
-            if not active: 
-                continue
         if only_banned and not u.get("banned", False):
             continue
-        remain = "غير محدود" if u.get("unlimited") else pretty_duration_from_secs(max(0, u.get("expires_at",0)-now_ts()))
+        if only_active:
+            active = u.get("unlimited") or (int(u.get("expires_at",0)) > now)
+            if not active: 
+                continue
+        remain = "غير محدود" if u.get("unlimited") else pretty_duration_from_secs(max(0, int(u.get("expires_at",0))-now))
         rows.append(
             f"<tr><td>{u['id']}</td>"
             f"<td>{remain}</td>"
             f"<td>{u.get('devices',1)}</td>"
-            f"<td>{','.join(u.get('hwids',[])) or '-'}</td>"
+            f"<td class='small'>{','.join(u.get('hwids',[])) or '-'}</td>"
             f"<td>{'نعم' if u.get('banned') else 'لا'}</td></tr>"
         )
     if not rows:
         rows.append("<tr><td colspan=5>لا يوجد</td></tr>")
     return "<table><tr><th>ID</th><th>المدة</th><th>الأجهزة</th><th>HWIDs</th><th>محظور؟</th></tr>" + "".join(rows) + "</table>"
 
-def render_keys_table(db: dict, token: str | None = None) -> str:
+def render_keys_table(db: dict) -> str:
     rows = []
     for k in db.get("keys", {}).values():
         mins = int(k.get("minutes",0))
@@ -310,109 +362,141 @@ def render_keys_table(db: dict, token: str | None = None) -> str:
             f"<td>{dur}</td>"
             f"<td>{k.get('devices',1)}</td>"
             f"<td>{'مرة واحدة' if k.get('single_use',True) else 'متكرر'}</td>"
-            f"<td>{k.get('used_by') or '-'}</td></tr>"
+            f"<td class='small'>{k.get('used_by') or '-'}</td></tr>"
         )
     if not rows:
         rows.append("<tr><td colspan=5>لا يوجد مفاتيح</td></tr>")
-    table = "<table><tr><th>الكود</th><th>المدة</th><th>الأجهزة</th><th>الاستخدام</th><th>Used By</th></tr>" + "".join(rows) + "</table>"
-    forms = (
-        "<div style='margin-top:8px'>"
-        "<form method='post' action='/admin/delete_key' style='display:inline-block'>"
-        f"<input type='hidden' name='token' value='{token or ''}'>"
-        "حذف كود: <input name='code' placeholder='ABCD-1234' style='width:160px'> "
-        "<button class='bad'>حذف</button>"
-        "</form> "
-        "<form method='post' action='/admin/edit_key' style='display:inline-block;margin-left:8px'>"
-        f"<input type='hidden' name='token' value='{token or ''}'>"
-        "تعديل كود: <input name='code' placeholder='ABCD-1234' style='width:160px'> "
-        "قيمة: <input name='amount' value='60' style='width:70px'> "
-        "<select name='unit'><option value='m'>دقائق</option><option value='h'>ساعات</option><option value='d'>أيام</option><option value='mo'>شهور</option></select> "
-        "أجهزة: <input name='devices' value='1' style='width:60px'> "
-        "غير محدود؟ <input type='checkbox' name='unlimited'> "
-        "مرّة واحدة؟ <input type='checkbox' name='single_use'> "
-        "<button>تعديل</button>"
-        "</form>"
-        "</div>"
-    )
-    return table + forms
+    return "<table><tr><th>الكود</th><th>المدة</th><th>الأجهزة</th><th>الاستخدام</th><th>Used By</th></tr>" + "".join(rows) + "</table>"
 
-# ------------------------------ Admin UI ------------------------------
+def gbadge(db: dict) -> str:
+    g = db["globals"]
+    return (f"<div class='badge'>"
+            f"<span>أونلاين (تقريبي): <b>{g.get('online',0)}</b></span>"
+            f"</div>")
+
+# ------------------------------ Admin HOME ------------------------------
 @app.get("/", response_class=HTMLResponse)
-def admin_home(token: str | None = None):
+def admin_home():
     db = load_db()
     g  = db["globals"]
-    topbar = (
+
+    top = (
         "<div class='topbar'>"
-        "<div><h1 style='margin:0'>لوحة إدارة — MyAddon</h1></div>"
-        f"<div class='badge'>أونلاين (تقريبي): <b>{g.get('online',0)}</b></div>"
+        "<h1 style='margin:6px 0'>لوحة إدارة — MyAddon</h1>"
+        f"{gbadge(db)}"
         "</div>"
     )
+
+    token_bar = (
+        "<div class='card'>"
+        "<div class='pwwrap'>"
+        "التوكن: <input id='admintoken' type='password' placeholder='أدخل التوكن هنا' style='width:260px' autocomplete='off'>"
+        "<button type='button' id='togglepw'>إظهار</button>"
+        "</div>"
+        "<div class='small'>لن يُعرض التوكن في الرابط، ويتم حقنه تلقائيًا داخل الاستمارات عند الإرسال.</div>"
+        "</div>"
+    )
+
     toggles = (
-        "<div class='box'>"
+        "<div class='card'>"
+        "<h2>تحكم عام</h2>"
         "<form method='post' action='/toggle'>"
-        f"مدخل الإشراف (token): <input name='token' value='{token or ''}' style='width:160px'> "
-        f"<button name='what' value='free'>{'إيقاف' if g.get('free_mode') else 'تشغيل'} الوضع المجاني</button> "
-        f"<button name='what' value='lock'>{'فتح' if g.get('lockdown') else 'إغلاق'} عن الكل</button> "
+        "<input type='hidden' name='token' value=''>"
+        f"<button class='primary' name='what' value='free'>{'إيقاف' if g.get('free_mode') else 'تشغيل'} الوضع المجاني</button> "
+        f"<button class='primary' name='what' value='lock'>{'فتح' if g.get('lockdown') else 'إغلاق'} عن الكل</button> "
         "</form>"
         "</div>"
     )
+
     activate_id = (
-        "<div class='box'>"
-        "<h2>تفعيل مباشر من ID</h2>"
+        "<div class='card'>"
+        "<h2>تفعيل مباشر عبر ID</h2>"
         "<form method='post' action='/admin/activate_id'>"
-        f"<input type='hidden' name='token' value='{token or ''}'>"
-        "ID: <input name='id' required style='width:140px'> "
+        "<input type='hidden' name='token' value=''>"
+        "ID: <input name='id' required style='width:160px'> "
         "قيمة: <input name='amount' value='30' style='width:70px'> "
         "وحدة: <select name='unit'>"
         "<option value='m'>دقائق</option><option value='h'>ساعات</option>"
         "<option value='d'>أيام</option><option value='mo'>شهور</option></select> "
         "أجهزة: <input name='devices' value='1' style='width:60px'> "
         "غير محدود؟ <input type='checkbox' name='unlimited'> "
-        "<button>تفعيل/تعديل</button>"
+        "<button class='primary'>تفعيل/تعديل</button>"
         "</form>"
         "</div>"
     )
+
     keys_box = (
-        "<div class='box'>"
-        "<h2>مفاتيح</h2>"
-        "<form method='post' action='/admin/create_key'>"
-        f"<input type='hidden' name='token' value='{token or ''}'>"
-        "كود (اتركه فاضي للتوليد): <input name='code' placeholder='ABCD-1234-EFGH-5678' style='width:240px'> "
+        "<div class='card'>"
+        "<h2>مفاتيح — إضافة/إدارة</h2>"
+        "<form method='post' action='/admin/create_keys'>"
+        "<input type='hidden' name='token' value=''>"
+        "<div class='small'>سطر لكل كود. اترك الحقل فارغًا لتوليد كود واحد تلقائيًا.</div>"
+        "<textarea name='codes' placeholder='ABCD-1234-EEEE-5678&#10;WXYZ-0000-9999-ABCD'></textarea>"
+        "<div style='margin-top:8px'>"
         "قيمة: <input name='amount' value='60' style='width:70px'> "
-        "وحدة: <select name='unit'>"
-        "<option value='m'>دقائق</option><option value='h'>ساعات</option>"
-        "<option value='d'>أيام</option><option value='mo'>شهور</option></select> "
+        "وحدة: <select name='unit'><option value='m'>دقائق</option><option value='h'>ساعات</option><option value='d'>أيام</option><option value='mo'>شهور</option></select> "
         "أجهزة: <input name='devices' value='1' style='width:60px'> "
         "غير محدود؟ <input type='checkbox' name='unlimited'> "
         "مرّة واحدة؟ <input type='checkbox' name='single_use' checked> "
-        "<button>إضافة</button>"
-        "</form>"
-        "<div class='small'>المفاتيح الحالية:</div>"
-        f"{render_keys_table(db, token)}"
+        "<button class='primary'>حفظ</button>"
         "</div>"
-    )
-    search_user = (
-        "<div class='box'>"
-        "<h2>بحث عن مستخدم</h2>"
-        "<form method='get' action='/admin/user'>"
-        "ID: <input name='id' style='width:160px'> "
-        f"<input type='hidden' name='token' value='{token or ''}'>"
-        "<button>بحث</button>"
         "</form>"
-        "</div>"
-    )
-    lists_box = (
-        "<div class='box'>"
-        "<h2>القوائم</h2>"
-        "<div class='small'>مشتركين:</div>"
-        f"{render_users_table(db, only_active=True)}"
         "<hr>"
-        "<div class='small'>محظورين:</div>"
-        f"{render_users_table(db, only_banned=True)}"
+        f"{render_keys_table(db)}"
+        "<div style='margin-top:8px'>"
+        "<form method='post' action='/admin/delete_key' style='display:inline-block'>"
+        "<input type='hidden' name='token' value=''>"
+        "حذف كود: <input name='code' placeholder='ABCD-1234' style='width:180px'> "
+        "<button class='danger'>حذف</button>"
+        "</form> "
+        "<form method='post' action='/admin/edit_key' style='display:inline-block;margin-inline-start:10px'>"
+        "<input type='hidden' name='token' value=''>"
+        "تعديل كود: <input name='code' placeholder='ABCD-1234' style='width:180px'> "
+        "قيمة: <input name='amount' value='60' style='width:70px'> "
+        "<select name='unit'><option value='m'>دقائق</option><option value='h'>ساعات</option><option value='d'>أيام</option><option value='mo'>شهور</option></select> "
+        "أجهزة: <input name='devices' value='1' style='width:60px'> "
+        "غير محدود؟ <input type='checkbox' name='unlimited'> "
+        "مرّة واحدة؟ <input type='checkbox' name='single_use'> "
+        "<button class='primary'>تعديل</button>"
+        "</form>"
+        "</div>"
         "</div>"
     )
-    return html_shell("لوحة الإدارة", topbar + toggles + activate_id + keys_box + search_user + lists_box)
 
+    user_tools = (
+        "<div class='card'>"
+        "<h2>بحث/قوائم</h2>"
+        "<form method='get' action='/admin/user' style='margin-bottom:10px'>"
+        "ID: <input name='id' style='width:160px'> "
+        "<button class='primary'>فتح</button>"
+        "</form>"
+        "<div class='grid'>"
+        f"<div><div class='small'>مشتركين (نشطين):</div>{render_users_table(db, only_active=True)}</div>"
+        f"<div><div class='small'>محظورين:</div>{render_users_table(db, only_banned=True)}</div>"
+        "</div>"
+        "</div>"
+    )
+
+    bulk = (
+        "<div class='card'>"
+        "<h2>عمليات جماعية (خطر)</h2>"
+        "<div class='small'>قبل التصفير تُنشأ نسخة احتياطية، ويمكن الرجوع لها.</div>"
+        "<form method='post' action='/admin/bulk_zero' class='confirm' style='padding:10px;margin-top:8px;border-radius:10px'>"
+        "<input type='hidden' name='token' value=''>"
+        "اكتب <b>ZERO</b> للتأكيد: <input name='confirm' placeholder='ZERO' style='width:120px'> "
+        "<button class='danger'>تصفير مدة الجميع</button>"
+        "</form>"
+        "<form method='post' action='/admin/bulk_undo' style='margin-top:8px'>"
+        "<input type='hidden' name='token' value=''>"
+        "<button class='primary'>تراجع (استرجاع النسخة الاحتياطية)</button>"
+        "</form>"
+        "</div>"
+    )
+
+    body = top + token_bar + toggles + activate_id + keys_box + user_tools + bulk
+    return html_shell("لوحة الإدارة", body)
+
+# ------------------------------ Admin actions ------------------------------
 @app.post("/toggle")
 def admin_toggle(what: str = Form(...), token: str = Form("")):
     db = load_db()
@@ -422,12 +506,12 @@ def admin_toggle(what: str = Form(...), token: str = Form("")):
     elif what == "lock":
         db["globals"]["lockdown"] = not db["globals"].get("lockdown", False)
     save_db(db)
-    return RedirectResponse(url=f"/?token={token}", status_code=302)
+    return RedirectResponse(url="/", status_code=302)
 
-@app.post("/admin/create_key")
-def admin_create_key(
+@app.post("/admin/create_keys")
+def admin_create_keys(
     token: str = Form(""),
-    code: str = Form(""),
+    codes: str = Form(""),
     amount: int = Form(60),
     unit: str = Form("m"),
     devices: int = Form(1),
@@ -437,23 +521,36 @@ def admin_create_key(
     db = load_db()
     require_admin(db, token, "admin")
     minutes = 0 if unlimited else minutes_from_unit(amount, unit)
-    if not code:
+
+    # فك الأكواد من textarea
+    codes = codes.strip()
+    created = []
+    if not codes:
         parts = [secrets.token_hex(2).upper() for _ in range(4)]
         code = "-".join(parts)
-    code = code.upper()
-    if not KEY_RE.match(code):
-        return PlainTextResponse("صيغة كود غير صحيحة", status_code=400)
+        created.append(code)
+    else:
+        for line in codes.splitlines():
+            line = line.strip().upper()
+            if not line:
+                parts = [secrets.token_hex(2).upper() for _ in range(4)]
+                line = "-".join(parts)
+            created.append(line)
+
     db.setdefault("keys", {})
-    db["keys"][code] = {
-        "code": code,
-        "minutes": minutes,
-        "devices": max(1,int(devices)),
-        "unlimited": bool(unlimited),
-        "single_use": (single_use is not None),
-        "used_by": None
-    }
+    for code in created:
+        if not KEY_RE.match(code):
+            continue
+        db["keys"][code] = {
+            "code": code,
+            "minutes": minutes,
+            "devices": max(1,int(devices)),
+            "unlimited": bool(unlimited),
+            "single_use": (single_use is not None),
+            "used_by": None
+        }
     save_db(db)
-    return RedirectResponse(url=f"/?token={token}", status_code=302)
+    return RedirectResponse(url="/", status_code=302)
 
 @app.post("/admin/delete_key")
 def admin_delete_key(token: str = Form(""), code: str = Form(...)):
@@ -463,7 +560,7 @@ def admin_delete_key(token: str = Form(""), code: str = Form(...)):
     if code in db.get("keys", {}):
         del db["keys"][code]
         save_db(db)
-        return RedirectResponse(url=f"/?token={token}", status_code=302)
+        return RedirectResponse(url="/", status_code=302)
     return PlainTextResponse("لم يتم العثور على الكود", status_code=404)
 
 @app.post("/admin/edit_key")
@@ -489,59 +586,98 @@ def admin_edit_key(
     key["single_use"]= (single_use is not None)
     db["keys"][code] = key
     save_db(db)
-    return RedirectResponse(url=f"/?token={token}", status_code=302)
+    return RedirectResponse(url="/", status_code=302)
 
+# صفحة مستخدم
 @app.get("/admin/user", response_class=HTMLResponse)
-def admin_get_user(id: str, token: str | None = None):
+def admin_get_user(id: str):
     db = load_db()
     u = db["users"].get(id)
     if not u:
-        body = f"<div class='box'>لا يوجد مستخدم بهذا الـID: <b>{id}</b></div><a href='/?token={token or ''}'>رجوع</a>"
+        body = (
+            "<div class='topbar'><h1>المستخدم</h1></div>"
+            "<div class='card'>لا يوجد مستخدم بهذا الـID.</div>"
+            "<div class='card'><a href='/'>رجوع</a></div>"
+        )
         return html_shell("المستخدم", body)
-    remain = "غير محدود" if u.get("unlimited") else pretty_duration_from_secs(max(0, u.get("expires_at",0)-now_ts()))
-    body = (
-        "<div class='box'>"
+
+    remain = "غير محدود" if u.get("unlimited") else pretty_duration_from_secs(max(0, int(u.get("expires_at",0))-now_ts()))
+    pwbar = (
+        "<div class='card'>"
+        "<div class='pwwrap'>"
+        "التوكن: <input id='admintoken' type='password' placeholder='أدخل التوكن هنا' style='width:260px' autocomplete='off'>"
+        "<button type='button' id='togglepw'>إظهار</button>"
+        "</div>"
+        "<div class='small'>لن يُعرض التوكن في الرابط، ويتم حقنه تلقائيًا داخل الاستمارات.</div>"
+        "</div>"
+    )
+    info = (
+        "<div class='card'>"
         f"<h2>المستخدم: {id}</h2>"
         f"<div>المدة: <b>{remain}</b></div>"
         f"<div>الأجهزة: <b>{u.get('devices',1)}</b></div>"
         f"<div>HWIDs: <span class='small'>{','.join(u.get('hwids',[])) or '-'}</span></div>"
         f"<div>محظور؟ <b>{'نعم' if u.get('banned') else 'لا'}</b></div>"
-        "<hr>"
+        "</div>"
+    )
+    forms = (
+        "<div class='grid'>"
+        "<div class='card'>"
+        "<h2>زيادة/تنقيص الوقت</h2>"
         "<form method='post' action='/admin/adjust_time'>"
-        f"<input type='hidden' name='token' value='{token or ''}'>"
+        "<input type='hidden' name='token' value=''>"
         f"<input type='hidden' name='id' value='{id}'>"
         "قيمة: <input name='amount' value='30' style='width:70px'> "
         "وحدة: <select name='unit'><option value='m'>دقائق</option><option value='h'>ساعات</option><option value='d'>أيام</option><option value='mo'>شهور</option></select> "
-        "<button name='op' value='add'>زيادة</button> "
-        "<button name='op' value='sub'>تنقيص</button>"
+        "<button class='primary' name='op' value='add'>زيادة</button> "
+        "<button class='primary' name='op' value='sub'>تنقيص</button>"
         "</form>"
-        "<form method='post' action='/admin/set_devices' style='margin-top:8px'>"
-        f"<input type='hidden' name='token' value='{token or ''}'>"
+        "</div>"
+        "<div class='card'>"
+        "<h2>تعديل حد الأجهزة</h2>"
+        "<form method='post' action='/admin/set_devices'>"
+        "<input type='hidden' name='token' value=''>"
         f"<input type='hidden' name='id' value='{id}'>"
-        f"حد الأجهزة: <input name='devices' value='{u.get('devices',1)}' style='width:70px'> "
-        "<button>تعديل</button>"
+        f"حد الأجهزة: <input name='devices' value='{u.get('devices',1)}' style='width:80px'> "
+        "<button class='primary'>حفظ</button>"
         "</form>"
-        "<form method='post' action='/admin/set_unlimited' style='margin-top:8px'>"
-        f"<input type='hidden' name='token' value='{token or ''}'>"
+        "</div>"
+        "<div class='card'>"
+        "<h2>غير محدود</h2>"
+        "<form method='post' action='/admin/set_unlimited'>"
+        "<input type='hidden' name='token' value=''>"
         f"<input type='hidden' name='id' value='{id}'>"
         f"غير محدود؟ <input type='checkbox' name='unlimited' {'checked' if u.get('unlimited') else ''}> "
-        "<button>تحديث</button>"
+        "<button class='primary'>تحديث</button>"
         "</form>"
-        "<form method='post' action='/admin/ban' style='margin-top:8px;display:inline-block'>"
-        f"<input type='hidden' name='token' value='{token or ''}'>"
-        f"<input type='hidden' name='id' value='{id}'>"
-        "<button class='bad'>حظر</button>"
-        "</form>"
-        "<form method='post' action='/admin/unban' style='margin-top:8px;display:inline-block'>"
-        f"<input type='hidden' name='token' value='{token or ''}'>"
-        f"<input type='hidden' name='id' value='{id}'>"
-        "<button class='ok'>فك الحظر</button>"
-        "</form>"
-        "<hr>"
-        f"<a href='/?token={token or ''}'>رجوع</a>"
         "</div>"
+        "<div class='card'>"
+        "<h2>تغيير الـID</h2>"
+        "<form method='post' action='/admin/change_id'>"
+        "<input type='hidden' name='token' value=''>"
+        f"<input type='hidden' name='old_id' value='{id}'>"
+        "ID جديد: <input name='new_id' placeholder='ID جديد' style='width:180px' required> "
+        "<button class='primary'>تغيير</button>"
+        "</form>"
+        "<div class='small'>يتم نقل الاشتراك وHWIDs وتحديث المفاتيح المستخدمة.</div>"
+        "</div>"
+        "<div class='card'>"
+        "<h2>حظر/فك الحظر</h2>"
+        "<form method='post' action='/admin/ban' style='display:inline-block'>"
+        "<input type='hidden' name='token' value=''>"
+        f"<input type='hidden' name='id' value='{id}'>"
+        "<button class='danger'>حظر</button>"
+        "</form> "
+        "<form method='post' action='/admin/unban' style='display:inline-block;margin-inline-start:10px'>"
+        "<input type='hidden' name='token' value=''>"
+        f"<input type='hidden' name='id' value='{id}'>"
+        "<button class='primary'>فك الحظر</button>"
+        "</form>"
+        "</div>"
+        "</div>"
+        "<div class='card'><a href='/'>&larr; رجوع</a></div>"
     )
-    return html_shell("المستخدم", body)
+    return html_shell("المستخدم", pwbar + info + forms)
 
 @app.post("/admin/activate_id")
 def admin_activate_id(
@@ -566,7 +702,7 @@ def admin_activate_id(
         u["unlimited"] = False
     db["users"][id] = u
     save_db(db)
-    return RedirectResponse(url=f"/admin/user?id={id}&token={token}", status_code=302)
+    return RedirectResponse(url=f"/admin/user?id={id}", status_code=302)
 
 @app.post("/admin/adjust_time")
 def admin_adjust_time(
@@ -580,7 +716,7 @@ def admin_adjust_time(
     require_admin(db, token, "activator")
     u = ensure_user(db, id)
     if u.get("unlimited"):
-        return RedirectResponse(url=f"/admin/user?id={id}&token={token}", status_code=302)
+        return RedirectResponse(url=f"/admin/user?id={id}", status_code=302)
     mins = minutes_from_unit(amount, unit)
     cur = max(0, int(u.get("expires_at",0)))
     if op == "add":
@@ -590,7 +726,7 @@ def admin_adjust_time(
         u["expires_at"] = max(0, cur - mins*60)
     db["users"][id] = u
     save_db(db)
-    return RedirectResponse(url=f"/admin/user?id={id}&token={token}", status_code=302)
+    return RedirectResponse(url=f"/admin/user?id={id}", status_code=302)
 
 @app.post("/admin/set_devices")
 def admin_set_devices(token: str = Form(""), id: str = Form(...), devices: int = Form(...)):
@@ -600,7 +736,7 @@ def admin_set_devices(token: str = Form(""), id: str = Form(...), devices: int =
     u["devices"] = max(1, int(devices))
     db["users"][id] = u
     save_db(db)
-    return RedirectResponse(url=f"/admin/user?id={id}&token={token}", status_code=302)
+    return RedirectResponse(url=f"/admin/user?id={id}", status_code=302)
 
 @app.post("/admin/set_unlimited")
 def admin_set_unlimited(token: str = Form(""), id: str = Form(...), unlimited: str | None = Form(None)):
@@ -614,7 +750,27 @@ def admin_set_unlimited(token: str = Form(""), id: str = Form(...), unlimited: s
         u["unlimited"] = False
     db["users"][id] = u
     save_db(db)
-    return RedirectResponse(url=f"/admin/user?id={id}&token={token}", status_code=302)
+    return RedirectResponse(url=f"/admin/user?id={id}", status_code=302)
+
+@app.post("/admin/change_id")
+def admin_change_id(token: str = Form(""), old_id: str = Form(...), new_id: str = Form(...)):
+    db = load_db()
+    require_admin(db, token, "admin")
+    old_id = old_id.strip()
+    new_id = new_id.strip()
+    if not new_id or new_id in db["users"]:
+        return PlainTextResponse("ID غير صالح أو موجود مسبقًا", status_code=400)
+    u = db["users"].pop(old_id, None)
+    if not u:
+        return PlainTextResponse("المستخدم غير موجود", status_code=404)
+    u["id"] = new_id
+    db["users"][new_id] = u
+    # تحديث المفاتيح المستخدمة
+    for k in db.get("keys", {}).values():
+        if k.get("used_by") == old_id:
+            k["used_by"] = new_id
+    save_db(db)
+    return RedirectResponse(url=f"/admin/user?id={new_id}", status_code=302)
 
 @app.post("/admin/ban")
 def admin_ban(token: str = Form(""), id: str = Form(...)):
@@ -624,7 +780,7 @@ def admin_ban(token: str = Form(""), id: str = Form(...)):
     u["banned"] = True
     db["users"][id] = u
     save_db(db)
-    return RedirectResponse(url=f"/admin/user?id={id}&token={token}", status_code=302)
+    return RedirectResponse(url=f"/admin/user?id={id}", status_code=302)
 
 @app.post("/admin/unban")
 def admin_unban(token: str = Form(""), id: str = Form(...)):
@@ -634,7 +790,28 @@ def admin_unban(token: str = Form(""), id: str = Form(...)):
     u["banned"] = False
     db["users"][id] = u
     save_db(db)
-    return RedirectResponse(url=f"/admin/user?id={id}&token={token}", status_code=302)
+    return RedirectResponse(url=f"/admin/user?id={id}", status_code=302)
+
+@app.post("/admin/bulk_zero")
+def admin_bulk_zero(token: str = Form(""), confirm: str = Form("")):
+    db = load_db()
+    require_admin(db, token, "admin")
+    if confirm.strip().upper() != "ZERO":
+        return PlainTextResponse("لم يتم التأكيد. اكتب ZERO.", status_code=400)
+    backup_db()
+    for u in db.get("users", {}).values():
+        u["unlimited"] = False
+        u["expires_at"] = 0
+    save_db(db)
+    return RedirectResponse(url="/", status_code=302)
+
+@app.post("/admin/bulk_undo")
+def admin_bulk_undo(token: str = Form("")):
+    db = load_db()
+    require_admin(db, token, "admin")
+    if restore_backup():
+        return RedirectResponse(url="/", status_code=302)
+    return PlainTextResponse("لا توجد نسخة احتياطية", status_code=404)
 
 # ------------------------------ Health ------------------------------
 @app.get("/health")
@@ -643,5 +820,5 @@ def health():
 
 # ------------------------------ Local dev runner ------------------------------
 if __name__ == "__main__":
-    import uvicorn, os
+    import uvicorn
     uvicorn.run("app_single:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)

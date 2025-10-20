@@ -304,25 +304,25 @@ hr{{border:0;border-top:1px solid var(--border);margin:16px 0}}
 .codebox{{font-family:Consolas,monospace;font-size:12px;background:#0b1218;padding:10px;border-radius:10px;border:1px dashed var(--border)}}
 </style>
 <script>
-function wireToken(){{
+function wireToken(){{{{  /* لاحظ مضاعفة الأقواس داخل f-string */
   const pw = document.getElementById('admintoken');
-  function inject(form){{
+  function inject(form){{{{
     if(!pw) return true;
     const h = form.querySelector('input[name=token]');
     if(h) h.value = pw.value;
     return true;
-  }}
-  document.querySelectorAll('form').forEach(f=>{{
+  }}}}
+  document.querySelectorAll('form').forEach(f=>{{{{
     f.addEventListener('submit', ()=>inject(f));
-  }});
+  }}}});
   const tgl=document.getElementById('togglepw');
-  if(tgl && pw){{
-    tgl.addEventListener('click', ()=>{
+  if(tgl && pw){{{{
+    tgl.addEventListener('click', ()=>{{{{
       pw.type = (pw.type==='password'?'text':'password');
       tgl.textContent = (pw.type==='password'?'إظهار':'إخفاء');
-    });
-  }}
-}}
+    }}}});
+  }}}}
+}}}}
 window.addEventListener('DOMContentLoaded', wireToken);
 </script>
 </head><body>

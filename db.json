@@ -2,45 +2,10 @@
   "globals": {
     "free_mode": false,
     "lockdown": false,
-    "online": 1,
-    "admin_token": "ibrahim202426933"
+    "online": 0,
+    "admin_token": "admin"
   },
-  "users": {
-    "105381": {
-      "id": "105381",
-      "expires_at": 0,
-      "unlimited": true,
-      "devices": 1,
-      "hwids": [
-        "125A4CA6-574F-4BBA-BBCB-58B4C79227D7"
-      ],
-      "banned": false,
-      "role": "user",
-      "last_seen": 1760566628
-    },
-    "80487D273": {
-      "id": "80487D273",
-      "expires_at": 1760167710,
-      "unlimited": false,
-      "devices": 1,
-      "hwids": [],
-      "banned": false,
-      "role": "user"
-    }
-  },
-  "keys": {
-    "8079-1C6F-7521-973F": {
-      "code": "8079-1C6F-7521-973F",
-      "minutes": 60,
-      "devices": 1,
-      "unlimited": false,
-      "single_use": true,
-      "used_by": null
-    }
-  },
-  "admins": {},
-  "8079-1C6F-7521-973F": {},
-  "0B82-3DEB-3CB9-C6A3": {},
-  "F51E-06F0-A430-989B": {}
-
+  "users": {},
+  "keys": {},
+  "admins": {}
 }

@@ -138,7 +138,8 @@ def api_check(id: str = "", hwid: str = ""):
         "free_mode": bool(g.get("free_mode", False)),
         "unlimited": False,
         "remain": 0,
-        "online": 0
+        "online": 0,
+        "device_limit": False
     }
 
     # إقفال مؤقت
@@ -183,19 +184,23 @@ def api_check(id: str = "", hwid: str = ""):
         resp["online"] = g["online"]
         return JSONResponse(resp)
 
-    # ربط HWID ضمن حد الأجهزة
+    # ربط HWID ضمن حد الأجهزة — نفس السلوك القديم تمامًا لو ما أُرسل hwid
+    # (توافق كامل مع أي إضافة قديمة)، ونرفض بس لو جهاز جديد له hwid
+    # وتجاوز حد الأجهزة المسموح
     dev_limit = int(u.get("devices", 1))
     hwids = list(u.get("hwids", []))
-    if hwid and hwid not in hwids and len(hwids) < dev_limit:
-        hwids.append(hwid)
-        u["hwids"] = hwids
 
-    # تجاوز الحد
-    if len(u.get("hwids", [])) > dev_limit:
-        g["online"] = _compute_online(db)
-        save_db(db)
-        resp["online"] = g["online"]
-        return JSONResponse(resp)
+    if hwid and hwid not in hwids:
+        if len(hwids) < dev_limit:
+            hwids.append(hwid)
+            u["hwids"] = hwids
+        else:
+            # تجاوز حد الأجهزة — هذا الجهاز مو من ضمن الأجهزة المسجّلة، نرفضه
+            resp["device_limit"] = True
+            g["online"] = _compute_online(db)
+            save_db(db)
+            resp["online"] = g["online"]
+            return JSONResponse(resp)
 
     # تحديث آخر ظهور
     u["last_seen"] = now_ts()

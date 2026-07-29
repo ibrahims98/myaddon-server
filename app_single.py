@@ -14,11 +14,11 @@ Run local:
 """
 
 from __future__ import annotations
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, Form, HTTPException, Request, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from pydantic import BaseModel
 from datetime import datetime, timezone
-import os, json, re, secrets, shutil
+import os, json, re, secrets, shutil, urllib.request, urllib.parse
 
 APP_TITLE = "MyAddon Server"
 DB_FILE   = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "db.json"))
@@ -40,7 +40,11 @@ DEFAULT_DB = {
     },
     "users": {},
     "keys": {},
-    "admins": {}
+    "admins": {},
+    # سجل دخول لوحة الإدارة — إضافة فقط، بدون أي مسار حذف أو تعديل عليه إطلاقًا
+    "admin_login_log": [],
+    # جلسات الدخول النشطة الحالية (تُنشأ عند تسجيل الدخول، تُحذف عند الخروج فقط)
+    "admin_sessions": {}
 }
 
 def now_ts() -> int:
@@ -268,6 +272,96 @@ def api_activate_by_key(req: KeyActivateReq):
     save_db(db)
     return JSONResponse({"ok": True, "msg": "activated"})
 
+# ------------------------------ Admin Session/Login Log helpers ------------------------------
+SESSION_COOKIE = "sonic_admin_sid"
+TOKEN_COOKIE = "sonic_admin_tok"  # HttpOnly — يُستخدم بس لتعبئة حقل التوكن بنماذج الإجراءات تلقائيًا
+
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def geolocate_ip(ip: str) -> str:
+    """موقع تقريبي من الـ IP (خدمة مجانية بدون مفتاح). أفضل جهد — ما يوقف تسجيل الدخول لو فشل."""
+    try:
+        if ip in ("unknown", "127.0.0.1", "localhost") or ip.startswith("10.") or ip.startswith("192.168."):
+            return "شبكة محلية/غير معروفة"
+        url = f"http://ip-api.com/json/{urllib.parse.quote(ip)}?fields=status,country,city"
+        with urllib.request.urlopen(url, timeout=3) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        if data.get("status") == "success":
+            city = data.get("city") or ""
+            country = data.get("country") or ""
+            loc = ", ".join([p for p in (city, country) if p])
+            return loc or "غير معروف"
+    except Exception:
+        pass
+    return "غير معروف"
+
+def get_session(db: dict, request: Request) -> dict | None:
+    sid = request.cookies.get(SESSION_COOKIE)
+    if not sid:
+        return None
+    return db.get("admin_sessions", {}).get(sid)
+
+def is_logged_in(db: dict, request: Request) -> bool:
+    return get_session(db, request) is not None
+
+def create_session(db: dict, request: Request) -> str:
+    sid = secrets.token_urlsafe(32)
+    ip = client_ip(request)
+    ua = request.headers.get("user-agent", "unknown")
+    now = now_ts()
+    db.setdefault("admin_sessions", {})[sid] = {"created": now, "ip": ip, "ua": ua}
+    # سجل دخول ثابت — إضافة فقط، لا يوجد أي مسار بالسيرفر يحذفه أو يعدّله
+    db.setdefault("admin_login_log", []).append({
+        "ts": now,
+        "ip": ip,
+        "ua": ua,
+        "location": geolocate_ip(ip),
+    })
+    return sid
+
+def render_login_log(db: dict) -> str:
+    rows = []
+    for entry in reversed(db.get("admin_login_log", [])[-50:]):  # آخر 50 دخول
+        dt = datetime.fromtimestamp(entry.get("ts", 0), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        ua = (entry.get("ua") or "")[:60]
+        rows.append(
+            f"<tr><td class='small'>{dt}</td>"
+            f"<td class='small'>{entry.get('ip','-')}</td>"
+            f"<td class='small'>{entry.get('location','-')}</td>"
+            f"<td class='small'>{ua}</td></tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan=4>لا يوجد سجل دخول بعد</td></tr>")
+    return (
+        "<div class='card'>"
+        "<h2>🔒 سجل دخول لوحة الإدارة (ثابت — غير قابل للحذف أو التعديل)</h2>"
+        "<div class='small' style='margin-bottom:8px'>آخر 50 محاولة دخول ناجحة، مع الجهاز والموقع التقريبي (من IP).</div>"
+        "<table><tr><th>الوقت</th><th>IP</th><th>الموقع التقريبي</th><th>الجهاز/المتصفح</th></tr>"
+        + "".join(rows) + "</table></div>"
+    )
+
+def render_login_gate(error: str = "") -> HTMLResponse:
+    err_html = f"<div class='card' style='border-color:#703939'><span class='bad'>{error}</span></div>" if error else ""
+    body = f"""
+    <div style="max-width:380px;margin:80px auto;text-align:center">
+      <h1 style="margin-bottom:4px">🔐 لوحة إدارة MyAddon</h1>
+      <div class="small" style="margin-bottom:18px">أدخل كلمة المرور للمتابعة</div>
+      {err_html}
+      <div class="card">
+        <form method="post" action="/admin/login">
+          <input type="password" name="token" placeholder="كلمة المرور" autocomplete="off"
+                 style="width:100%;box-sizing:border-box;margin-bottom:10px" required autofocus>
+          <button class="primary" style="width:100%">دخول</button>
+        </form>
+      </div>
+    </div>
+    """
+    return html_shell("تسجيل الدخول", body)
+
 # ------------------------------ Admin helpers + UI ------------------------------
 def require_admin(db: dict, token: str | None, level: str = "viewer"):
     need = db["globals"].get("admin_token", "admin")
@@ -288,23 +382,26 @@ def html_shell(title: str, body: str) -> HTMLResponse:
   --ok:#3ddc97; --bad:#ff8a8a; --btn:#161b22; --btnb:#2d3947;
 }}
 *{{box-sizing:border-box}}
-body{{background:var(--bg);color:var(--text);font-family:Segoe UI,Arial;margin:16px}}
+body{{background:var(--bg);color:var(--text);font-family:Segoe UI,Arial;margin:0;padding:20px;line-height:1.5}}
 a{{color:var(--link)}}
-h1,h2{{color:var(--accent);margin:8px 0 10px}}
-.card{{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:14px;padding:14px;margin:10px 0}}
-.topbar{{position:sticky;top:0;z-index:10;background:var(--bg);padding-bottom:8px;margin-bottom:10px;border-bottom:1px solid var(--border)}}
-.badge{{background:#0d1b26;border:1px solid var(--border);border-radius:999px;padding:6px 10px;color:var(--text);display:inline-flex;gap:6px;align-items:center}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}}
+h1,h2{{color:var(--accent);margin:8px 0 12px;font-weight:700}}
+h1{{font-size:22px}} h2{{font-size:16px;padding-bottom:6px;border-bottom:1px solid var(--border)}}
+.card{{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--border);border-radius:14px;padding:16px;margin:12px 0;box-shadow:0 2px 10px rgba(0,0,0,.25)}}
+.topbar{{position:sticky;top:0;z-index:10;background:var(--bg);padding:10px 0 12px;margin-bottom:12px;border-bottom:1px solid var(--border)}}
+.badge{{background:#0d1b26;border:1px solid var(--border);border-radius:999px;padding:6px 12px;color:var(--text);display:inline-flex;gap:6px;align-items:center}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}}
 label{{display:inline-block;margin:4px 0}}
-input,select,button,textarea{{background:var(--btn);color:var(--text);border:1px solid var(--btnb);border-radius:10px;padding:8px}}
-button{{cursor:pointer}}
+input,select,button,textarea{{background:var(--btn);color:var(--text);border:1px solid var(--btnb);border-radius:10px;padding:9px;font-family:inherit}}
+button{{cursor:pointer;font-weight:600;transition:filter .15s}}
+button:hover{{filter:brightness(1.15)}}
 button.primary{{background:#1f2a36;border-color:#3b4c61}}
 button.danger{{background:#2a1515;border-color:#703939;color:#ffbdbd}}
-table{{border-collapse:collapse;width:100%;font-size:14px}}
-th,td{{border:1px solid var(--border);padding:6px;text-align:center}}
+table{{border-collapse:collapse;width:100%;font-size:13px;margin-top:6px}}
+th,td{{border:1px solid var(--border);padding:7px;text-align:center}}
+th{{background:#0d1218;color:var(--accent)}}
 .small{{font-size:12px;color:var(--muted)}}
 .ok{{color:var(--ok)}} .bad{{color:var(--bad)}}
-.pwwrap{{display:flex;align-items:center;gap:8px}}
+.pwwrap{{display:flex;align-items:center;gap:8px;flex-wrap:wrap}}
 hr{{border:0;border-top:1px solid var(--border);margin:16px 0}}
 .codebox{{font-family:Consolas,monospace;font-size:12px;background:#0b1218;padding:10px;border-radius:10px;border:1px dashed var(--border)}}
 </style>
@@ -381,21 +478,28 @@ def gbadge(db: dict) -> str:
 
 # ------------------------------ Admin HOME ------------------------------
 @app.get("/", response_class=HTMLResponse)
-def admin_home():
+def admin_home(request: Request):
     db = load_db()
+
+    if not is_logged_in(db, request):
+        return render_login_gate()
+
     g  = db["globals"]
+    saved_token = request.cookies.get(TOKEN_COOKIE, "")
 
     top = (
-        "<div class='topbar'>"
+        "<div class='topbar' style='display:flex;justify-content:space-between;align-items:center'>"
         "<h1 style='margin:6px 0'>لوحة إدارة — MyAddon</h1>"
-        f"{gbadge(db)}"
+        f"<div style='display:flex;gap:10px;align-items:center'>{gbadge(db)}"
+        "<form method='post' action='/admin/logout' style='margin:0'>"
+        "<button class='danger' type='submit'>خروج</button></form></div>"
         "</div>"
     )
 
     token_bar = (
         "<div class='card'>"
         "<div class='pwwrap'>"
-        "التوكن: <input id='admintoken' type='password' placeholder='أدخل التوكن هنا' style='width:260px' autocomplete='off'>"
+        f"التوكن: <input id='admintoken' type='password' value='{saved_token}' placeholder='أدخل التوكن هنا' style='width:260px' autocomplete='off'>"
         "<button type='button' id='togglepw'>إظهار</button>"
         "</div>"
         "<div class='small'>لن يُعرض التوكن في الرابط، ويتم حقنه تلقائيًا داخل الاستمارات عند الإرسال.</div>"
@@ -498,8 +602,36 @@ def admin_home():
         "</div>"
     )
 
-    body = top + token_bar + toggles + activate_id + keys_box + user_tools + bulk
+    body = top + token_bar + toggles + activate_id + keys_box + user_tools + bulk + render_login_log(db)
     return html_shell("لوحة الإدارة", body)
+
+# ------------------------------ Admin Login/Logout ------------------------------
+@app.post("/admin/login")
+def admin_login(request: Request, token: str = Form(...)):
+    db = load_db()
+    need = db["globals"].get("admin_token", "admin")
+    if not need or token != need:
+        return render_login_gate("❌ كلمة المرور غير صحيحة.")
+    sid = create_session(db, request)
+    save_db(db)
+    resp = RedirectResponse(url="/", status_code=302)
+    # HttpOnly لجلسة الدخول (ما يقدر جافاسكربت يقرأها)
+    resp.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
+    # نفس التوكن، HttpOnly أيضًا — يُستخدم بس من طرف السيرفر لتعبئة حقل النماذج تلقائيًا
+    resp.set_cookie(TOKEN_COOKIE, token, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
+    return resp
+
+@app.post("/admin/logout")
+def admin_logout(request: Request):
+    db = load_db()
+    sid = request.cookies.get(SESSION_COOKIE)
+    if sid and sid in db.get("admin_sessions", {}):
+        del db["admin_sessions"][sid]
+        save_db(db)
+    resp = RedirectResponse(url="/", status_code=302)
+    resp.delete_cookie(SESSION_COOKIE)
+    resp.delete_cookie(TOKEN_COOKIE)
+    return resp
 
 # ------------------------------ Admin actions ------------------------------
 @app.post("/toggle")
@@ -595,8 +727,10 @@ def admin_edit_key(
 
 # صفحة مستخدم
 @app.get("/admin/user", response_class=HTMLResponse)
-def admin_get_user(id: str):
+def admin_get_user(id: str, request: Request):
     db = load_db()
+    if not is_logged_in(db, request):
+        return render_login_gate()
     u = db["users"].get(id)
     if not u:
         body = (
@@ -606,11 +740,12 @@ def admin_get_user(id: str):
         )
         return html_shell("المستخدم", body)
 
+    saved_token = request.cookies.get(TOKEN_COOKIE, "")
     remain = "غير محدود" if u.get("unlimited") else pretty_duration_from_secs(max(0, int(u.get("expires_at",0))-now_ts()))
     pwbar = (
         "<div class='card'>"
         "<div class='pwwrap'>"
-        "التوكن: <input id='admintoken' type='password' placeholder='أدخل التوكن هنا' style='width:260px' autocomplete='off'>"
+        f"التوكن: <input id='admintoken' type='password' value='{saved_token}' placeholder='أدخل التوكن هنا' style='width:260px' autocomplete='off'>"
         "<button type='button' id='togglepw'>إظهار</button>"
         "</div>"
         "<div class='small'>لن يُعرض التوكن في الرابط، ويتم حقنه تلقائيًا داخل الاستمارات.</div>"
